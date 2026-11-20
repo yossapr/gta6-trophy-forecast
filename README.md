@@ -6,7 +6,7 @@
 
 An offline Node.js 22 forecaster for PS5 trophy earn rates on Exophase. It returns the 5th, 25th, 50th, 75th and 95th percentiles in percentage units for each trophy listed in a case.
 
-The forecaster collapses unchanged page reads and reconstructs the feasible earner counts from Exophase's two-decimal percentages and player totals. A short case that sees just one launch state uses a separate import model. Its player-population prior uses the aggregate change reported in the official rules (638 to 3,868). It varies that denominator and models new unlocks as small integer additions. It derives every trophy's starting count from the case and rounds each scenario to Exophase's displayed precision.
+The forecaster collapses unchanged page reads and reconstructs the feasible earner counts from Exophase's two-decimal percentages and player totals. A short case that sees just one launch state uses a separate import model. Its player-population prior uses the aggregate change reported in the official rules (638 to 3,868). It varies that denominator, allows small corrections to the preview counts and models ordinary and accelerated unlocks based on the trophy description. It derives every trophy's starting count from the case and rounds each scenario to Exophase's displayed precision.
 
 With later refreshes available, the model fits recent and longer trends on a logarithmic time axis. It blends relative earner growth with direct logit trends and dampens long extrapolations. When several recent refreshes are consistent with an unchanged rare-trophy count, the predictive distribution includes a scenario where the count persists while the player population grows. Trend disagreement, observation noise and limited history widen the remaining scenarios.
 

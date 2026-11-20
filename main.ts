@@ -40,15 +40,15 @@ function hoursSince(time: string, origin: number): number {
   return (Date.parse(time) - origin) / 3_600_000;
 }
 
-function observations(data: ForecastCase, release: number): Observation[][] {
+function observations(data: ForecastCase, release: number, checkpoint: number): Observation[][] {
   const histories = data.trophies.map((): Observation[] => []);
   for (const snapshot of data.history) {
     const count = snapshot.players_tracked;
     const hour = hoursSince(snapshot.at, release);
-    if (count <= 0 || !Number.isFinite(hour)) continue;
+    if (!Number.isFinite(count) || count <= 0 || !Number.isFinite(hour) || hour >= checkpoint) continue;
     for (const [index, history] of histories.entries()) {
       const percent = snapshot.rates[index];
-      if (percent === null || percent === undefined) continue;
+      if (typeof percent !== 'number' || !Number.isFinite(percent) || percent < 0 || percent > 100) continue;
       const proportion = percent * 0.01;
       const last = history.at(-1);
       if (last?.players === count && last.rate === proportion) continue;
@@ -100,28 +100,45 @@ function probabilityQuantiles(scenarios: Scenario[]): number[] {
   });
 }
 
-function launchPrior(last: Observation, trophy: Trophy, checkpointHour: number, targetHour: number): number[] {
+function launchPrior(last: Observation, trophy: Trophy, targetHour: number): number[] {
   // Early holders mostly carry through a denominator-heavy import. Preserve
   // integer earners, with asymmetric room for fresh unlocks.
   const elapsed = Math.max(0, targetHour - Math.max(0, last.hour));
   const refresh = clamp(elapsed / 4.2, 0, .995);
-  const quick = /chapter 1\b|activity once|fishing challenge/i.test(trophy.description);
-  const hoursAhead = Math.max(0, targetHour - checkpointHour);
-  const mean = (quick ? 1.05 : .22) * clamp(hoursAhead / 1.5, .3, 2);
+  const text = trophy.description;
+  const endgame = /attain 100%|^complete chapter [2-9]\b|^complete the final mission\./i.test(text);
+  const quick = /chapter 1\b|activity once|fishing challenge|an arcade game/i.test(text);
+  const mission = /^complete [a-z].{1,35}\.$/i.test(text) && !/chapter|final|every|all/i.test(text);
+  const duration = clamp(elapsed / 4.5, .45, 1.6);
+  const arrivalMeans = quick ? [1.6, 5.2] : endgame ? [.16, .8] : mission ? [.65, 4.0] : [.55, 1.8];
   const scenarios: Scenario[] = [{ rate: last.rate, probability: 1 - refresh }];
   const denominatorScenarios = [
     { factor: .92, weight: .10 }, { factor: .97, weight: .20 }, { factor: 1, weight: .40 },
     { factor: 1.03, weight: .20 }, { factor: 1.09, weight: .10 },
   ];
-  for (const { factor, weight } of denominatorScenarios) {
-    const players = Math.round(last.players * firstImportRatio * factor);
+  // Intake may also reconcile the preview population. Include small negative
+  // numerator adjustments before modeling unlocks by incoming players.
+  const reconciliation = [
+    { adjustment: 0, weight: .72 }, { adjustment: -1, weight: .20 }, { adjustment: -2, weight: .08 },
+  ];
+  const previewCount = Math.round(last.earners);
+  for (const [arrival, baseMean] of arrivalMeans.entries()) {
+    const mean = baseMean * duration;
+    const arrivalWeight = arrival === 0 ? .80 : .20;
     let probability = Math.exp(-mean);
-    let leftover = 1;
-    for (let added = 0; added <= 10; added++) {
-      const share = added === 10 ? leftover : probability;
-      const rate = Math.round(clamp((Math.round(last.earners) + added) / players, 0, 1) * 10_000) / 10_000;
-      scenarios.push({ rate, probability: refresh * weight * share });
-      leftover = Math.max(0, leftover - share);
+    let remaining = 1;
+    for (let added = 0; added <= 18; added++) {
+      const share = added === 18 ? remaining : probability;
+      for (const denominator of denominatorScenarios) {
+        const players = Math.round(last.players * firstImportRatio * denominator.factor);
+        for (const correction of reconciliation) {
+          const earners = clamp(previewCount + added + correction.adjustment, 0, players);
+          const rate = Math.round(10_000 * earners / players) / 10_000;
+          const mass = refresh * arrivalWeight * share * denominator.weight * correction.weight;
+          scenarios.push({ rate, probability: mass });
+        }
+      }
+      remaining = Math.max(0, remaining - share);
       probability *= mean / (added + 1);
     }
   }
@@ -151,12 +168,12 @@ function observedNoise(rows: Observation[], slope: number): number {
   return Math.sqrt(squared / (rows.length - 1));
 }
 
-function forecast(series: Observation[], trophy: Trophy, checkpointHour: number, targetHour: number, horizon: number): number[] {
+function forecast(series: Observation[], trophy: Trophy, targetHour: number, horizon: number): number[] {
   const last = series.at(-1);
   if (!last) return [0.0001, 0.0003, 0.001, 0.003, 0.01];
   if (isEntryTrophy(trophy, last)) return [0.9999, 0.9999, 1, 1, 1];
   if (series.length === 1 && last.hour < 8 && horizon <= 8) {
-    return launchPrior(last, trophy, checkpointHour, targetHour);
+    return launchPrior(last, trophy, targetHour);
   }
 
   const candidate = series.filter(row => row.hour >= 3 && row.hour >= last.hour - 48);
@@ -212,12 +229,13 @@ function run(data: ForecastCase) {
   const launchTime = Date.parse(data.game.release_date);
   const hoursAhead = data.horizon_minutes / 60;
   const targetAge = hoursSince(data.target, launchTime);
-  const checkpointAge = data.at ? hoursSince(data.at, launchTime) : targetAge - hoursAhead;
-  const histories = observations(data, launchTime);
+  const reportedCheckpoint = hoursSince(data.at, launchTime);
+  const checkpoint = Number.isFinite(reportedCheckpoint) ? reportedCheckpoint : targetAge - hoursAhead;
+  const histories = observations(data, launchTime, checkpoint);
   return {
     trophies: data.trophies.map((trophy, index) => ({
       id: trophy.id,
-      q: forecast(histories[index], trophy, checkpointAge, targetAge, hoursAhead)
+      q: forecast(histories[index], trophy, targetAge, hoursAhead)
         .map(proportion => Math.round(proportion * 10_000_000) / 100_000),
     })),
   };
