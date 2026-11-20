@@ -1,39 +1,170 @@
-import {readdirSync, readFileSync, mkdirSync, writeFileSync} from 'node:fs';
-import {join} from 'node:path';
-const input = process.env.MAKEFUN_INPUT_DIR || '/input';
-const output = process.env.MAKEFUN_OUTPUT_DIR || '/output';
-const z = [-1.644854,-0.67449,0,0.67449,1.644854];
-const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-const lg = p => Math.log(clamp(p,0.01,99.99)/(100-clamp(p,0.01,99.99)));
-const logistic = v => 100/(1+Math.exp(-clamp(v,-25,25)));
-function forecast(c,i) {
-  const obs = c.history.filter(h => Number.isFinite(h.rates[i])).map(h => ({t:Date.parse(h.at), n:h.players_tracked, p:h.rates[i]}));
-  if (!obs.length) return z.map(() => 0.01);
-  const last = obs[obs.length-1], end = Date.parse(c.target);
-  const earliest = end - 14*86400000;
-  let points = obs.filter(h => h.t >= Math.max(earliest,last.t-48*3600000));
-  // A repeated snapshot is not a new observation; keep the last representative.
-  points = points.filter((h,j) => j===points.length-1 || h.n!==points[j+1].n || h.p!==points[j+1].p);
-  const x = points.map(h=>Math.log1p(Math.max(0,(h.t-Date.parse(c.game.release_date+'T00:00:00Z'))/3600000)));
-  const y = points.map(h=>lg(h.p));
-  let slope=0, residual=0;
-  if (points.length>=3 && x[x.length-1]-x[0]>0.03) {
-    const xm=x.reduce((a,b)=>a+b,0)/x.length, ym=y.reduce((a,b)=>a+b,0)/y.length;
-    let xx=0,xy=0; for(let j=0;j<x.length;j++){xx+=(x[j]-xm)**2;xy+=(x[j]-xm)*(y[j]-ym);}
-    slope=clamp(xy/(xx+0.2),-1.5,1.5);
-    residual=Math.sqrt(y.reduce((a,v,j)=>a+(v-ym-slope*(x[j]-xm))**2,0)/y.length);
-  }
-  const base=Date.parse(c.game.release_date+'T00:00:00Z');
-  const step=Math.max(0,Math.log1p(Math.max(0,(end-base)/3600000))-Math.log1p(Math.max(0,(last.t-base)/3600000)));
-  const median=lg(last.p)+slope*step;
-  const horizon=Math.max(0,c.horizon_minutes/1440);
-  const spread=clamp(0.18+0.22*Math.sqrt(horizon)+residual*0.65,0.18,1.4);
-  return z.map(v=>Math.round(logistic(median+v*spread)*10000)/10000);
-}
-mkdirSync(output,{recursive:true});
-for(const file of readdirSync(input).filter(f=>f.endsWith('.in')).sort()) {
- const c=JSON.parse(readFileSync(join(input,file),'utf8'));
- const trophies=c.trophies.map((t,i)=>({id:t.id,q:forecast(c,i)}));
- writeFileSync(join(output,file.slice(0,-3)+'.out'),JSON.stringify({trophies})+'\n');
+import { readdirSync, readFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+type Trophy = { id: number; description: string };
+type Snapshot = {
+  at: string;
+  players_tracked: number;
+  rates: Array<number | null>;
+};
+type ForecastCase = {
+  game: { release_date: string };
+  history: Snapshot[];
+  trophies: Trophy[];
+  horizon_minutes: number;
+  target: string;
+};
+type Observation = {
+  hour: number;
+  players: number;
+  earners: number;
+  rate: number;
+};
+
+const normalQuantiles = [-1.645, -0.674, 0, 0.674, 1.645];
+const clamp = (x: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, x));
+const logit = (p: number) => Math.log(p / (1 - p));
+const logistic = (x: number) => 1 / (1 + Math.exp(-x));
+const boundRate = (p: number) => clamp(p, 0.0001, 0.9999);
+const age = (hour: number) => Math.log(6 + Math.max(0, hour));
+
+function hoursSince(time: string, origin: number): number {
+  return (Date.parse(time) - origin) / 3_600_000;
 }
 
+function observations(data: ForecastCase, release: number): Observation[][] {
+  const histories = data.trophies.map((): Observation[] => []);
+  for (const snapshot of data.history) {
+    const count = snapshot.players_tracked;
+    const hour = hoursSince(snapshot.at, release);
+    if (count <= 0 || !Number.isFinite(hour)) continue;
+    for (const [index, history] of histories.entries()) {
+      const percent = snapshot.rates[index];
+      if (percent === null || percent === undefined) continue;
+      const proportion = percent * 0.01;
+      const last = history.at(-1);
+      if (last?.players === count && last.rate === proportion) continue;
+      const reportedCount = count * proportion;
+      history.push({
+        hour,
+        players: count,
+        earners: count < 10_000 ? Math.round(reportedCount) : reportedCount,
+        rate: proportion,
+      });
+    }
+  }
+  return histories;
+}
+
+function weightedSlope(times: number[], values: number[], weights: number[]): number {
+  const mass = weights.reduce((sum, weight) => sum + weight, 0);
+  if (times.length < 2 || !mass) return 0;
+  const atMean = times.reduce((sum, time, i) => sum + time * weights[i], 0) / mass;
+  const valueMean = values.reduce((sum, value, i) => sum + value * weights[i], 0) / mass;
+  let covariance = 0;
+  let variance = 0;
+  for (const [i, time] of times.entries()) {
+    const distance = time - atMean;
+    covariance += weights[i] * distance * (values[i] - valueMean);
+    variance += weights[i] * distance ** 2;
+  }
+  return variance > 1e-8 ? covariance / variance : 0;
+}
+
+function isEntryTrophy(trophy: Trophy, last: Observation): boolean {
+  return last.rate === 1 && /complete/i.test(trophy.description) &&
+    !/chapter|final|every|all/i.test(trophy.description);
+}
+
+function launchPrior(last: Observation, trophy: Trophy, horizon: number): number[] {
+  // A small preview cohort can be more advanced than the first broad import.
+  const dilution = [9, 7.2, 5.8, 4.6, 3.2];
+  const fast = /chapter 1|activity once|fishing challenge/i.test(trophy.description);
+  const strength = clamp(Math.sqrt(horizon / 1.5), 0.4, 1.25);
+  return dilution.map((factor, index) => {
+    const additions = fast ? [0, 0.4, 1, 2, 5][index] : [0, 0, 0.15, 0.5, 1.5][index];
+    return boundRate((last.earners + additions) / (last.players * factor ** strength));
+  });
+}
+
+function fitTrends(rows: Observation[], lastHour: number, decay: number) {
+  const xs = rows.map(row => age(row.hour));
+  const weights = rows.map(row => Math.exp((row.hour - lastHour) / decay));
+  return {
+    players: clamp(weightedSlope(xs, rows.map(row => Math.log(row.players)), weights), 0, 3),
+    earners: clamp(weightedSlope(xs, rows.map(row => Math.log(row.earners + 0.5)), weights), 0, 5),
+    logits: clamp(weightedSlope(xs, rows.map(row => logit(boundRate(row.rate))), weights), -3, 4),
+  };
+}
+
+function observedNoise(rows: Observation[], slope: number): number {
+  if (rows.length < 3) return 0;
+  let squared = 0;
+  for (let i = 1; i < rows.length; i++) {
+    const before = rows[i - 1];
+    const after = rows[i];
+    const delta = logit(boundRate(after.rate)) - logit(boundRate(before.rate));
+    const fitted = slope * (age(after.hour) - age(before.hour));
+    squared += Math.min(0.8, Math.abs(delta - fitted)) ** 2;
+  }
+  return Math.sqrt(squared / (rows.length - 1));
+}
+
+function forecast(series: Observation[], trophy: Trophy, targetHour: number, horizon: number): number[] {
+  const last = series.at(-1);
+  if (!last) return [0.0001, 0.0003, 0.001, 0.003, 0.01];
+  if (isEntryTrophy(trophy, last)) return [0.9999, 0.9999, 1, 1, 1];
+  if (series.length === 1 && last.hour < 8 && horizon <= 8) {
+    return launchPrior(last, trophy, horizon);
+  }
+
+  const candidate = series.filter(row => row.hour >= 3 && row.hour >= last.hour - 48);
+  const fit = candidate.length >= 3 ? candidate : series;
+  const recent = fit.filter(row => row.hour >= last.hour - 20);
+  const long = fitTrends(fit, last.hour, 24);
+  const short = fitTrends(recent, last.hour, 11);
+  const span = last.hour - fit[0].hour;
+  const recentSpan = last.hour - (recent[0]?.hour ?? last.hour);
+  const recentWeight = 0.55 * clamp(recentSpan / 12, 0, 1) * clamp((recent.length - 2) / 3, 0, 1);
+  const blend = (a: number, b: number) => a + recentWeight * (b - a);
+  const support = clamp(span / 18, 0, 1) * clamp((fit.length - 1) / 3, 0, 1);
+  const growth = Math.max(0, age(targetHour) - age(last.hour));
+  // Dampen the short observation window before extrapolating several days.
+  const effectiveGrowth = support * Math.log1p(0.55 * growth) / 0.55;
+  const relativeTrend = blend(long.earners, short.earners) - blend(long.players, short.players);
+  const countEstimate = logit(boundRate(last.rate * Math.exp(relativeTrend * effectiveGrowth)));
+  const observed = logit(boundRate(last.rate));
+  const rateSlope = blend(long.logits, short.logits);
+  const rateEstimate = observed + rateSlope * effectiveGrowth;
+  const rareWeight = last.rate < 0.05 ? 0.55 : 0.25;
+  const center = rareWeight * countEstimate + (1 - rareWeight) * rateEstimate;
+  const trendChange = recentWeight * Math.abs(long.logits - short.logits);
+  const noise = observedNoise(recent.length >= 4 ? recent : fit, rateSlope);
+  const extrapolation = growth * (0.23 + 0.41 * (1 - support) + 0.20 * trendChange);
+  const disagreement = 0.18 * Math.abs(countEstimate - rateEstimate);
+  const countUncertainty = 0.16 / Math.sqrt(last.earners + 0.5);
+  const spread = clamp(Math.hypot(0.09 + extrapolation, 1.25 * noise, disagreement, countUncertainty), 0.09, 2);
+  return normalQuantiles.map(z => boundRate(logistic(center + z * spread)));
+}
+
+function run(data: ForecastCase) {
+  const launchTime = Date.parse(data.game.release_date);
+  const hoursAhead = data.horizon_minutes / 60;
+  const targetAge = hoursSince(data.target, launchTime);
+  const histories = observations(data, launchTime);
+  return {
+    trophies: data.trophies.map((trophy, index) => ({
+      id: trophy.id,
+      q: forecast(histories[index], trophy, targetAge, hoursAhead)
+        .map(proportion => Math.round(proportion * 10_000_000) / 100_000),
+    })),
+  };
+}
+
+const input = process.env.MAKEFUN_INPUT_DIR || '/input';
+const output = process.env.MAKEFUN_OUTPUT_DIR || '/output';
+mkdirSync(output, { recursive: true });
+for (const file of readdirSync(input).filter(name => name.endsWith('.in')).sort()) {
+  const data: ForecastCase = JSON.parse(readFileSync(join(input, file), 'utf8'));
+  writeFileSync(join(output, file.slice(0, -3) + '.out'), JSON.stringify(run(data)) + '\n');
+}
