@@ -8,6 +8,7 @@ type Snapshot = {
   rates: Array<number | null>;
 };
 type ForecastCase = {
+  at: string;
   game: { release_date: string };
   history: Snapshot[];
   trophies: Trophy[];
@@ -18,10 +19,17 @@ type Observation = {
   hour: number;
   players: number;
   earners: number;
+  countMin: number;
+  countMax: number;
   rate: number;
 };
 
+type Scenario = { rate: number; probability: number };
+const levels = [0.05, 0.25, 0.5, 0.75, 0.95];
 const normalQuantiles = [-1.645, -0.674, 0, 0.674, 1.645];
+// The brief reports the first bulk import's aggregate player counts. The
+// answering per-trophy rates are not part of this prior.
+const firstImportRatio = 3868 / 638;
 const clamp = (x: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, x));
 const logit = (p: number) => Math.log(p / (1 - p));
 const logistic = (x: number) => 1 / (1 + Math.exp(-x));
@@ -45,10 +53,13 @@ function observations(data: ForecastCase, release: number): Observation[][] {
       const last = history.at(-1);
       if (last?.players === count && last.rate === proportion) continue;
       const reportedCount = count * proportion;
+      const countMin = Math.max(0, Math.ceil(reportedCount - count / 20_000 - 1e-8));
+      const countMax = Math.min(count, Math.floor(reportedCount + count / 20_000 + 1e-8));
       history.push({
         hour,
         players: count,
-        earners: count < 10_000 ? Math.round(reportedCount) : reportedCount,
+        earners: countMin === countMax ? countMin : reportedCount,
+        countMin, countMax,
         rate: proportion,
       });
     }
@@ -72,19 +83,49 @@ function weightedSlope(times: number[], values: number[], weights: number[]): nu
 }
 
 function isEntryTrophy(trophy: Trophy, last: Observation): boolean {
-  return last.rate === 1 && /complete/i.test(trophy.description) &&
+  return last.rate === 1 && /^complete\b/i.test(trophy.description) &&
     !/chapter|final|every|all/i.test(trophy.description);
 }
 
-function launchPrior(last: Observation, trophy: Trophy, horizon: number): number[] {
-  // A small preview cohort can be more advanced than the first broad import.
-  const dilution = [9, 7.2, 5.8, 4.6, 3.2];
-  const fast = /chapter 1|activity once|fishing challenge/i.test(trophy.description);
-  const strength = clamp(Math.sqrt(horizon / 1.5), 0.4, 1.25);
-  return dilution.map((factor, index) => {
-    const additions = fast ? [0, 0.4, 1, 2, 5][index] : [0, 0, 0.15, 0.5, 1.5][index];
-    return boundRate((last.earners + additions) / (last.players * factor ** strength));
+function probabilityQuantiles(scenarios: Scenario[]): number[] {
+  const ordered = scenarios.sort((a, b) => a.rate - b.rate);
+  const total = ordered.reduce((sum, item) => sum + item.probability, 0);
+  return levels.map(level => {
+    let remaining = level * total;
+    for (const item of ordered) {
+      remaining -= item.probability;
+      if (remaining <= 1e-12) return item.rate;
+    }
+    return ordered[ordered.length - 1].rate;
   });
+}
+
+function launchPrior(last: Observation, trophy: Trophy, checkpointHour: number, targetHour: number): number[] {
+  // Early holders mostly carry through a denominator-heavy import. Preserve
+  // integer earners, with asymmetric room for fresh unlocks.
+  const elapsed = Math.max(0, targetHour - Math.max(0, last.hour));
+  const refresh = clamp(elapsed / 4.2, 0, .995);
+  const quick = /chapter 1\b|activity once|fishing challenge/i.test(trophy.description);
+  const hoursAhead = Math.max(0, targetHour - checkpointHour);
+  const mean = (quick ? 1.05 : .22) * clamp(hoursAhead / 1.5, .3, 2);
+  const scenarios: Scenario[] = [{ rate: last.rate, probability: 1 - refresh }];
+  const denominatorScenarios = [
+    { factor: .92, weight: .10 }, { factor: .97, weight: .20 }, { factor: 1, weight: .40 },
+    { factor: 1.03, weight: .20 }, { factor: 1.09, weight: .10 },
+  ];
+  for (const { factor, weight } of denominatorScenarios) {
+    const players = Math.round(last.players * firstImportRatio * factor);
+    let probability = Math.exp(-mean);
+    let leftover = 1;
+    for (let added = 0; added <= 10; added++) {
+      const share = added === 10 ? leftover : probability;
+      const rate = Math.round(clamp((Math.round(last.earners) + added) / players, 0, 1) * 10_000) / 10_000;
+      scenarios.push({ rate, probability: refresh * weight * share });
+      leftover = Math.max(0, leftover - share);
+      probability *= mean / (added + 1);
+    }
+  }
+  return probabilityQuantiles(scenarios);
 }
 
 function fitTrends(rows: Observation[], lastHour: number, decay: number) {
@@ -110,12 +151,12 @@ function observedNoise(rows: Observation[], slope: number): number {
   return Math.sqrt(squared / (rows.length - 1));
 }
 
-function forecast(series: Observation[], trophy: Trophy, targetHour: number, horizon: number): number[] {
+function forecast(series: Observation[], trophy: Trophy, checkpointHour: number, targetHour: number, horizon: number): number[] {
   const last = series.at(-1);
   if (!last) return [0.0001, 0.0003, 0.001, 0.003, 0.01];
   if (isEntryTrophy(trophy, last)) return [0.9999, 0.9999, 1, 1, 1];
   if (series.length === 1 && last.hour < 8 && horizon <= 8) {
-    return launchPrior(last, trophy, horizon);
+    return launchPrior(last, trophy, checkpointHour, targetHour);
   }
 
   const candidate = series.filter(row => row.hour >= 3 && row.hour >= last.hour - 48);
@@ -132,6 +173,8 @@ function forecast(series: Observation[], trophy: Trophy, targetHour: number, hor
   // Dampen the short observation window before extrapolating several days.
   const effectiveGrowth = support * Math.log1p(0.55 * growth) / 0.55;
   const relativeTrend = blend(long.earners, short.earners) - blend(long.players, short.players);
+  const playerGrowth = blend(long.players, short.players) * effectiveGrowth;
+  const modeledPlayers = last.players * Math.exp(playerGrowth);
   const countEstimate = logit(boundRate(last.rate * Math.exp(relativeTrend * effectiveGrowth)));
   const observed = logit(boundRate(last.rate));
   const rateSlope = blend(long.logits, short.logits);
@@ -144,18 +187,37 @@ function forecast(series: Observation[], trophy: Trophy, targetHour: number, hor
   const disagreement = 0.18 * Math.abs(countEstimate - rateEstimate);
   const countUncertainty = 0.16 / Math.sqrt(last.earners + 0.5);
   const spread = clamp(Math.hypot(0.09 + extrapolation, 1.25 * noise, disagreement, countUncertainty), 0.09, 2);
-  return normalQuantiles.map(z => boundRate(logistic(center + z * spread)));
+  const trend = normalQuantiles.map(z => boundRate(logistic(center + z * spread)));
+  const tail = fit.slice(-4);
+  const lowerCount = Math.max(...tail.map(row => row.countMin));
+  const upperCount = Math.min(...tail.map(row => row.countMax));
+  if (last.rate < .015 && tail.length >= 3 && lowerCount <= upperCount && modeledPlayers > last.players) {
+    const stableCount = clamp(Math.round(last.earners), lowerCount, upperCount);
+    const unchanged = Math.round(10_000 * stableCount / modeledPlayers) / 10_000;
+    const plateauWeight = clamp((last.hour - tail[0].hour) / (18 + horizon / 5), .20, .58);
+    const weights = [.10, .20, .40, .20, .10];
+    const scenarios = trend.map((rate, index) => ({ rate, probability: (1 - plateauWeight) * weights[index] }));
+    scenarios.push({ rate: unchanged, probability: plateauWeight });
+    const quantiles = probabilityQuantiles(scenarios);
+    // A plausible plateau can shift the center; long-horizon breakthrough or
+    // player-growth risk still warrants the original extrapolation tails.
+    quantiles[0] = Math.min(quantiles[0], trend[0]);
+    quantiles[4] = Math.max(quantiles[4], trend[4]);
+    return quantiles;
+  }
+  return trend;
 }
 
 function run(data: ForecastCase) {
   const launchTime = Date.parse(data.game.release_date);
   const hoursAhead = data.horizon_minutes / 60;
   const targetAge = hoursSince(data.target, launchTime);
+  const checkpointAge = data.at ? hoursSince(data.at, launchTime) : targetAge - hoursAhead;
   const histories = observations(data, launchTime);
   return {
     trophies: data.trophies.map((trophy, index) => ({
       id: trophy.id,
-      q: forecast(histories[index], trophy, targetAge, hoursAhead)
+      q: forecast(histories[index], trophy, checkpointAge, targetAge, hoursAhead)
         .map(proportion => Math.round(proportion * 10_000_000) / 100_000),
     })),
   };
